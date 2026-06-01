@@ -1,0 +1,18 @@
+[package]
+name = "ad_graph_db"
+version = "0.1.0"
+edition = "2021"
+description = "An educational graph database in Rust using ports and adapters"
+
+[[bin]]
+name = "ad_graph_db"
+path = "src/main.rs"
+
+[lib]
+name = "ad_graph_db"
+path = "src/lib.rs"
+
+[dependencies]
+# Used only by the JSON storage adapter — the binary adapter is hand-written.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
