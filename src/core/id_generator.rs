@@ -5,7 +5,9 @@
 
 use super::{edge::EdgeId, node::NodeId};
 
-#[derive(Debug, Default)]
+// Clone is needed so Transaction can take a snapshot of the counter state
+// and allocate IDs independently before commit.
+#[derive(Debug, Default, Clone)]
 pub struct IdGenerator {
     next_node: u64,
     next_edge: u64,

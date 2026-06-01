@@ -6,4 +6,5 @@
 
 pub mod cache;
 pub mod engine;
+pub mod index;
 pub mod storage;

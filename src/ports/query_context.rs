@@ -23,6 +23,13 @@ pub trait DatabaseContext {
     fn get_node(&mut self, id: NodeId) -> Result<Option<Node>, GraphError>;
     fn get_all_nodes(&mut self) -> Result<Vec<Node>, GraphError>;
 
+    /// Load only the nodes that carry a specific label.
+    ///
+    /// Implementations backed by a LabelIndex return the small candidate set
+    /// directly — O(label_count) instead of O(N).  Implementations without an
+    /// index fall back to a full scan filtered by label.
+    fn get_nodes_by_label(&mut self, label: &str) -> Result<Vec<Node>, GraphError>;
+
     fn get_edge(&mut self, id: EdgeId) -> Result<Option<Edge>, GraphError>;
     fn get_all_edges(&mut self) -> Result<Vec<Edge>, GraphError>;
 

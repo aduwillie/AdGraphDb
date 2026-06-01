@@ -1,15 +1,20 @@
 // LayeredGraphDatabase — the assembled application.
 //
-// This is the only place where the three port adapters meet.
+// This is the only place where port adapters meet.
 // All external code interacts with this struct; it never holds concrete adapter
 // types (only Box<dyn Port>), so every adapter can be swapped at construction.
 //
-// ── Layer responsibilities ────────────────────────────────────────────────────
+// ── Layers ────────────────────────────────────────────────────────────────────
 //
 //   Engine  (GraphEnginePort)
 //     In-memory adjacency index.  Built from storage on open().
 //     Answers structural queries (neighbors, traversal, shortest path)
 //     without touching disk.
+//
+//   LabelIndex
+//     Secondary in-memory index: label → Vec<NodeId>.
+//     Converts O(N) label scans to O(1) lookups.
+//     Kept in sync on every insert/delete alongside the engine.
 //
 //   Cache   (CachePort)
 //     In-memory store for node/edge property data.
@@ -18,34 +23,33 @@
 //
 //   Storage (StoragePort)
 //     Durable write-ahead log on disk.
-//     Written on every mutation before the cache is updated,
-//     so data survives a crash.
-//
-// ── Read path ─────────────────────────────────────────────────────────────────
-//
-//   get_node(id):
-//     1. cache.get_node(id)      → return if Some
-//     2. storage.load_node(id)   → if Some: cache.put_node, return
-//     3. return None
+//     Written on every mutation before the cache is updated.
 //
 // ── Write path ────────────────────────────────────────────────────────────────
 //
 //   insert_node(label, props):
-//     1. id_generator.next_node_id()
-//     2. storage.save_node(&node)   ← durable first
-//     3. cache.put_node(node)
-//     4. engine.insert_node(id)
-//     5. return id
+//     1. storage.save_node(&node)   ← durable first
+//     2. cache.put_node(node)
+//     3. engine.insert_node(id)
+//     4. label_index.insert(id, label)  ← keep index in sync
 //
-// ── Delete path ───────────────────────────────────────────────────────────────
+// ── Read path (optimized) ─────────────────────────────────────────────────────
 //
-//   delete_node(id):
-//     1. storage.delete_node(id)  ← durable first
-//     2. cache.invalidate_node(id)
-//     3. engine.remove_node(id)   ← also removes incident edges from index
+//   MATCH NODE WHERE label = "City"    (before: O(N), now: O(label_count))
+//     1. label_index.get("City")       ← O(1) HashMap lookup
+//     2. For each id in the result:
+//          get_node(id)                ← cache hit or storage miss
+//     3. Apply property conditions
+//
+//   MATCH NODE (no label filter)       still O(N) — full scan needed
+//     1. engine.all_node_ids()
+//     2. get_node(id) for each
+//     3. Apply conditions
 
 use std::collections::HashMap;
 
+use crate::adapters::index::label_index::LabelIndex;
+use crate::algorithms::{bfs::BreadthFirstSearch, dfs::DepthFirstSearch, dijkstra::Dijkstra};
 use crate::core::{
     edge::{Edge, EdgeId},
     error::GraphError,
@@ -53,7 +57,6 @@ use crate::core::{
     node::{Node, NodeId},
     value::Value,
 };
-use crate::algorithms::{bfs::BreadthFirstSearch, dfs::DepthFirstSearch, dijkstra::Dijkstra};
 use crate::ports::{
     algorithm::{ShortestPathAlgorithm, TraversalAlgorithm},
     cache::CachePort,
@@ -62,31 +65,35 @@ use crate::ports::{
     storage::StoragePort,
 };
 use crate::query::{port::QueryLanguagePort, result::QueryResult};
+use crate::transaction::{CommitResult, Transaction};
 
 pub struct LayeredGraphDatabase {
     engine:       Box<dyn GraphEnginePort>,
     cache:        Box<dyn CachePort>,
     storage:      Box<dyn StoragePort>,
+    label_index:  LabelIndex,
     id_generator: IdGenerator,
 }
 
 impl LayeredGraphDatabase {
-    /// Construct the database from three adapter boxes.
+    /// Construct the database, replaying the WAL to rebuild all in-memory state.
     ///
-    /// Loads all nodes and edges from storage into the engine so structural
-    /// queries work immediately without hitting the disk.
-    /// The cache starts cold (populated lazily on first property read).
+    /// The cache starts cold.  The engine and label index are rebuilt from the
+    /// full node+edge record set — no separate index file is needed.
     pub fn open(
         storage: Box<dyn StoragePort>,
-        cache:       Box<dyn CachePort>,
-        mut engine:  Box<dyn GraphEnginePort>,
+        cache:   Box<dyn CachePort>,
+        mut engine: Box<dyn GraphEnginePort>,
     ) -> Result<Self, GraphError> {
         let mut id_gen = IdGenerator::new();
+        let mut label_index = LabelIndex::new();
 
-        // Rebuild the structural index from durable storage.
+        // load_all_nodes() returns full Node structs (label included),
+        // so we can populate both engine and label_index in one pass.
         for node in storage.load_all_nodes()? {
             id_gen.seed_from_node(node.id);
             engine.insert_node(node.id);
+            label_index.insert(node.id, &node.label);
         }
 
         for edge in storage.load_all_edges()? {
@@ -94,12 +101,7 @@ impl LayeredGraphDatabase {
             engine.insert_edge(edge.id, edge.source, edge.target, edge.weight);
         }
 
-        Ok(Self {
-            engine,
-            cache,
-            storage,
-            id_generator: id_gen,
-        })
+        Ok(Self { engine, cache, storage, label_index, id_generator: id_gen })
     }
 
     // ── Node operations ───────────────────────────────────────────────────────
@@ -113,8 +115,9 @@ impl LayeredGraphDatabase {
         let node = Node { id, label: label.into(), properties };
 
         self.storage.save_node(&node)?;
-        self.cache.put_node(node);
+        self.cache.put_node(node.clone());
         self.engine.insert_node(id);
+        self.label_index.insert(id, &node.label);
 
         Ok(id)
     }
@@ -123,39 +126,36 @@ impl LayeredGraphDatabase {
         if let Some(node) = self.cache.get_node(id) {
             return Ok(Some(node));
         }
-
         if let Some(node) = self.storage.load_node(id)? {
             self.cache.put_node(node.clone());
             return Ok(Some(node));
         }
-
         Ok(None)
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), GraphError> {
-        // Delete all edges incident to this node first (keep storage consistent).
-        let outgoing_edge_ids: Vec<EdgeId> = self
-            .engine
-            .neighbors_outgoing(id)
-            .into_iter()
-            .map(|n| n.edge_id)
-            .collect();
+        // Remove incident edges from storage and cache first.
+        let outgoing: Vec<EdgeId> = self
+            .engine.neighbors_outgoing(id)
+            .into_iter().map(|n| n.edge_id).collect();
+        let incoming: Vec<EdgeId> = self
+            .engine.neighbors_incoming(id)
+            .into_iter().map(|n| n.edge_id).collect();
 
-        let incoming_edge_ids: Vec<EdgeId> = self
-            .engine
-            .neighbors_incoming(id)
-            .into_iter()
-            .map(|n| n.edge_id)
-            .collect();
-
-        for eid in outgoing_edge_ids.into_iter().chain(incoming_edge_ids) {
+        for eid in outgoing.into_iter().chain(incoming) {
             self.storage.delete_edge(eid)?;
             self.cache.invalidate_edge(eid);
         }
 
+        // Remove the node from storage, cache, engine, and label index.
+        // To remove from the label index we need the label — load it first.
+        if let Some(node) = self.get_node(id)? {
+            self.label_index.remove(id, &node.label);
+        }
+
         self.storage.delete_node(id)?;
         self.cache.invalidate_node(id);
-        self.engine.remove_node(id); // also cleans up the edge index entries
+        self.engine.remove_node(id);
 
         Ok(())
     }
@@ -191,12 +191,10 @@ impl LayeredGraphDatabase {
         if let Some(edge) = self.cache.get_edge(id) {
             return Ok(Some(edge));
         }
-
         if let Some(edge) = self.storage.load_edge(id)? {
             self.cache.put_edge(edge.clone());
             return Ok(Some(edge));
         }
-
         Ok(None)
     }
 
@@ -209,28 +207,33 @@ impl LayeredGraphDatabase {
 
     // ── Structural queries ────────────────────────────────────────────────────
 
-    /// Direct outgoing neighbors of a node (from the in-memory engine — no I/O).
     pub fn neighbors_outgoing(&self, id: NodeId) -> Vec<crate::ports::engine::Neighbor> {
         self.engine.neighbors_outgoing(id)
     }
 
-    /// Direct incoming neighbors of a node.
     pub fn neighbors_incoming(&self, id: NodeId) -> Vec<crate::ports::engine::Neighbor> {
         self.engine.neighbors_incoming(id)
     }
 
     pub fn node_count(&self) -> usize { self.engine.node_count() }
     pub fn edge_count(&self) -> usize { self.engine.edge_count() }
-
     pub fn all_node_ids(&self) -> Vec<NodeId> { self.engine.all_node_ids() }
     pub fn all_edge_ids(&self) -> Vec<EdgeId> { self.engine.all_edge_ids() }
 
+    // ── Label index queries ───────────────────────────────────────────────────
+
+    /// All node IDs that carry a specific label.
+    /// O(1) — single HashMap lookup into the label index.
+    pub fn node_ids_by_label(&self, label: &str) -> &[NodeId] {
+        self.label_index.get(label)
+    }
+
+    /// How many nodes carry a specific label.
+    pub fn label_count(&self, label: &str) -> usize {
+        self.label_index.label_count(label)
+    }
+
     // ── Algorithm dispatch ────────────────────────────────────────────────────
-    //
-    // Algorithms receive a reference to the engine (structural data only).
-    // Property data is not passed — algorithms should not need it.
-    // If a future algorithm does need properties, add a second method that
-    // accepts &mut self and performs get_node calls inline.
 
     pub fn traverse(
         &self,
@@ -249,28 +252,8 @@ impl LayeredGraphDatabase {
         algorithm.find_shortest_path(self.engine.as_ref(), start, goal)
     }
 
-    // ── Maintenance ───────────────────────────────────────────────────────────
-
-    /// Rewrite the storage file to contain only live records (no tombstones).
-    /// Invalidates the cache because the storage file pointer is reset.
-    pub fn compact(&mut self) -> Result<(), GraphError> {
-        self.storage.compact()?;
-        self.cache.clear();
-        Ok(())
-    }
-
     // ── Query language execution ──────────────────────────────────────────────
 
-    /// Execute a query written in any language that implements QueryLanguagePort.
-    ///
-    /// ```rust,ignore
-    /// let simple  = SimpleQueryLanguage;
-    /// let cypher  = CypherLiteLanguage;
-    ///
-    /// // Identical intent, two surface syntaxes:
-    /// db.execute_query(&simple, "MATCH NODE WHERE label = \"City\"")?;
-    /// db.execute_query(&cypher, "MATCH (n:City) RETURN n")?;
-    /// ```
     pub fn execute_query(
         &mut self,
         language: &dyn QueryLanguagePort,
@@ -279,7 +262,16 @@ impl LayeredGraphDatabase {
         language.execute(query, self)
     }
 
-    /// Convenience: load all nodes through the cache/storage stack.
+    // ── Maintenance ───────────────────────────────────────────────────────────
+
+    pub fn compact(&mut self) -> Result<(), GraphError> {
+        self.storage.compact()?;
+        self.cache.clear();
+        Ok(())
+    }
+
+    // ── Bulk helpers (used by DatabaseContext impl and all_nodes/all_edges) ───
+
     pub fn all_nodes(&mut self) -> Result<Vec<Node>, GraphError> {
         let ids = self.engine.all_node_ids();
         let mut nodes = Vec::with_capacity(ids.len());
@@ -291,7 +283,18 @@ impl LayeredGraphDatabase {
         Ok(nodes)
     }
 
-    /// Convenience: load all edges through the cache/storage stack.
+    /// Load nodes for a specific label — uses the label index (O(label_count)).
+    pub fn nodes_by_label(&mut self, label: &str) -> Result<Vec<Node>, GraphError> {
+        let ids: Vec<NodeId> = self.label_index.get(label).to_vec();
+        let mut nodes = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(node) = self.get_node(id)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
+
     pub fn all_edges(&mut self) -> Result<Vec<Edge>, GraphError> {
         let ids = self.engine.all_edge_ids();
         let mut edges = Vec::with_capacity(ids.len());
@@ -302,13 +305,88 @@ impl LayeredGraphDatabase {
         }
         Ok(edges)
     }
+
+    // ── Transactions ──────────────────────────────────────────────────────────
+
+    /// Begin a transaction.  Operations staged on the returned value are
+    /// buffered in memory.  Call `commit_transaction` to apply them all
+    /// or `rollback_transaction` to discard them.
+    ///
+    /// The transaction receives a clone of the ID generator so it can
+    /// allocate IDs immediately — callers can reference inserted node IDs
+    /// in subsequent operations within the same transaction
+    /// (e.g. insert an edge between two nodes that don't exist yet).
+    pub fn begin_transaction(&mut self) -> Transaction {
+        Transaction::new(self.id_generator.clone())
+    }
+
+    /// Apply all staged operations to storage, cache, engine, and label index.
+    ///
+    /// Operations are applied in the order they were staged.  If any storage
+    /// write fails partway through, the changes applied so far are NOT rolled
+    /// back automatically — this is a client-side buffer, not a full ACID
+    /// transaction.  See docs/15_rust_concepts.md for the WAL-transaction
+    /// extension that would make this crash-safe.
+    pub fn commit_transaction(
+        &mut self,
+        txn: Transaction,
+    ) -> Result<CommitResult, GraphError> {
+        let mut result = CommitResult::default();
+
+        for op in txn.into_operations() {
+            use crate::transaction::StagedOp;
+            match op {
+                StagedOp::InsertNode { node } => {
+                    let id = node.id;
+                    let label = node.label.clone();
+                    self.storage.save_node(&node)?;
+                    self.cache.put_node(node);
+                    self.engine.insert_node(id);
+                    self.label_index.insert(id, &label);
+                    self.id_generator.seed_from_node(id);
+                    result.inserted_node_ids.push(id);
+                }
+                StagedOp::InsertEdge { edge } => {
+                    let id = edge.id;
+                    if !self.engine.contains_node(edge.source) {
+                        return Err(GraphError::NodeNotFound(edge.source));
+                    }
+                    if !self.engine.contains_node(edge.target) {
+                        return Err(GraphError::NodeNotFound(edge.target));
+                    }
+                    self.engine.insert_edge(id, edge.source, edge.target, edge.weight);
+                    self.storage.save_edge(&edge)?;
+                    self.cache.put_edge(edge);
+                    self.id_generator.seed_from_edge(id);
+                    result.inserted_edge_ids.push(id);
+                }
+                StagedOp::DeleteNode { id } => {
+                    self.delete_node(id)?;
+                    result.deleted_node_ids.push(id);
+                }
+                StagedOp::DeleteEdge { id } => {
+                    self.delete_edge(id)?;
+                    result.deleted_edge_ids.push(id);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Discard all staged operations.
+    ///
+    /// Because IDs are allocated eagerly inside the transaction, this call
+    /// must advance the database's ID generator past any IDs that were
+    /// assigned — otherwise the next non-transaction insert could reuse them.
+    pub fn rollback_transaction(&mut self, txn: Transaction) {
+        // Advance the generator past all IDs the transaction allocated,
+        // even though no data was written to storage, cache, or engine.
+        txn.seed_generator_into(&mut self.id_generator);
+    }
 }
 
 // ── DatabaseContext implementation ────────────────────────────────────────────
-//
-// The query subsystem never imports LayeredGraphDatabase directly.
-// It receives a &mut dyn DatabaseContext, which this impl satisfies.
-// This keeps the query layer decoupled from the database layer.
 
 impl DatabaseContext for LayeredGraphDatabase {
     fn get_node(&mut self, id: NodeId) -> Result<Option<Node>, GraphError> {
@@ -317,6 +395,11 @@ impl DatabaseContext for LayeredGraphDatabase {
 
     fn get_all_nodes(&mut self) -> Result<Vec<Node>, GraphError> {
         self.all_nodes()
+    }
+
+    /// Uses the label index — O(label_count) instead of O(N).
+    fn get_nodes_by_label(&mut self, label: &str) -> Result<Vec<Node>, GraphError> {
+        self.nodes_by_label(label)
     }
 
     fn get_edge(&mut self, id: EdgeId) -> Result<Option<Edge>, GraphError> {

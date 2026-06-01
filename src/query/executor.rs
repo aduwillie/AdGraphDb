@@ -25,8 +25,18 @@ pub fn execute(
         // ── Structural matches ────────────────────────────────────────────────
 
         QueryCommand::MatchNodes(filter) => {
-            let all = ctx.get_all_nodes()?;
-            let matched: Vec<_> = all.into_iter().filter(|n| filter.matches(n)).collect();
+            // Fast path: if the filter names a label, use the label index
+            // to fetch only the matching candidate set — O(label_count).
+            // Slow path: no label specified → full scan — O(N).
+            let candidates = match &filter.label {
+                Some(label) => ctx.get_nodes_by_label(label)?,
+                None        => ctx.get_all_nodes()?,
+            };
+            // Apply any remaining property conditions across the candidate set.
+            let matched: Vec<_> = candidates
+                .into_iter()
+                .filter(|n| filter.matches(n))
+                .collect();
             Ok(QueryResult::Nodes(matched))
         }
 
