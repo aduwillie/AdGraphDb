@@ -3,6 +3,11 @@
 This document describes the current limitations of AdGraphDb and the
 concrete techniques used by production graph databases to address them.
 
+> **See also**: [13_big_o_scale_and_startup.md](13_big_o_scale_and_startup.md)
+> for a concrete, quantified analysis of what happens with a billion nodes —
+> including memory calculations, startup time estimates, and the specific
+> code lines that break at scale.
+
 ---
 
 ## Current limitations

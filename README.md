@@ -216,7 +216,9 @@ AdGraphDb/
 │   ├── 08_algorithms.md         ← BFS, DFS, Dijkstra in depth
 │   ├── 09_query_language.md     ← SimpleQuery & CypherLite DSLs
 │   ├── 10_scale_and_production.md ← what it would take to scale
-│   └── 11_adding_adapters.md    ← code templates for extension points
+│   ├── 11_adding_adapters.md    ← code templates for extension points
+│   ├── 12_query_execution_deep_dive.md ← how queries work end-to-end
+│   └── 13_big_o_scale_and_startup.md  ← V/E/degree, billion nodes, structure persistence
 ├── src/
 │   ├── lib.rs
 │   ├── main.rs                  ← demo entry point
@@ -276,6 +278,8 @@ Read the docs in order for the best learning experience:
 9. **[09_query_language.md](docs/09_query_language.md)** — SimpleQuery and CypherLite DSLs.
 10. **[10_scale_and_production.md](docs/10_scale_and_production.md)** — What changes at scale.
 11. **[11_adding_adapters.md](docs/11_adding_adapters.md)** — Code templates for new adapters.
+12. **[12_query_execution_deep_dive.md](docs/12_query_execution_deep_dive.md)** — How queries execute end-to-end with traced examples.
+13. **[13_big_o_scale_and_startup.md](docs/13_big_o_scale_and_startup.md)** — V/E/degree defined; billion-node impact; structure persistence.
 
 ---
 

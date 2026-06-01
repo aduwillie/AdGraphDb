@@ -8,6 +8,22 @@ This is the hardest question to answer about any database.  In a relational
 database the answer is "start from a table."  In a graph database the answer
 is more subtle and more interesting.
 
+> **Big-O notation used in this document** — quick reference:
+>
+> | Symbol | Meaning |
+> |--------|---------|
+> | **V** | Total number of **vertices** (nodes) in the graph |
+> | **E** | Total number of **edges** |
+> | **degree** | Number of edges on one *specific* node (not the whole graph) |
+> | **O(1)** | Constant time — does not grow with V or E |
+> | **O(V)** | Grows linearly with total nodes — doubles when V doubles |
+> | **O(V + E)** | Visits every node once and every edge once |
+> | **O(degree)** | Proportional only to *one node's* connections — independent of V |
+>
+> See [13_big_o_scale_and_startup.md](13_big_o_scale_and_startup.md) for a full
+> explanation of these terms, what they mean at a billion nodes, and how the graph
+> structure is persisted and rebuilt at startup.
+
 ---
 
 ## Part 1 — The fundamental problem
@@ -353,12 +369,16 @@ Result:  QueryResult::Nodes([N0, N1, N3])
 **Cost breakdown:**
 ```
 engine.all_node_ids()     O(V) — HashMap key collection
-storage.load_node × V     O(N × WAL_size) first call; O(1) per node after cache warm
+storage.load_node × V     O(WAL_size) first call; O(1) per node after cache warm
 filter.matches × V        O(V × conditions)
 ─────────────────────────────────────────
-Total first call:         O(V × WAL_size)
-Total after cache warm:   O(V)
+Total first call:         O(V × WAL_size)   ← catastrophic at V = 1 billion
+Total after cache warm:   O(V)              ← still linear; needs indexes for scale
 ```
+
+> ⚠ **Scale note**: this is a full scan — every node is examined regardless
+> of how many match.  For V = 1 billion, this query is unusable without a
+> label or property index.  See [13_big_o_scale_and_startup.md](13_big_o_scale_and_startup.md).
 
 ### 4b. Direct point lookup
 
