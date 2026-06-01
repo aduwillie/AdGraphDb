@@ -280,7 +280,7 @@ Read the docs in order for the best learning experience:
 11. **[11_adding_adapters.md](docs/11_adding_adapters.md)** — Code templates for new adapters.
 12. **[12_query_execution_deep_dive.md](docs/12_query_execution_deep_dive.md)** — How queries execute end-to-end with traced examples.
 13. **[13_big_o_scale_and_startup.md](docs/13_big_o_scale_and_startup.md)** — V/E/degree defined; billion-node impact; structure persistence.
-14. *(reserved)*
+14. **[14_transactions.md](docs/14_transactions.md)** — ACID properties, how the transaction buffer works, WAL markers for crash-safety, isolation strategies.
 15. **[15_rust_concepts.md](docs/15_rust_concepts.md)** — Every Rust concept used in this repo, with code examples and rationale.
 
 ---

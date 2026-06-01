@@ -31,7 +31,7 @@
 //
 // To make transactions fully crash-safe, add BEGIN_TXN / COMMIT_TXN markers
 // to the WAL adapters so the replay logic can discard incomplete transactions.
-// This is described in docs/15_rust_concepts.md under "Transactions".
+// See docs/14_transactions.md Part 6 for the full implementation sketch.
 //
 // ── Rollback semantics ────────────────────────────────────────────────────────
 //
