@@ -1,6 +1,16 @@
 # Rust build artifacts
 /target/
 Cargo.lock
+debug/
+
+# Rust backup files (rustfmt)
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# Cargo mutants
+**/mutants.out*/
 
 # Database files created by the demo and tests
 *.json
