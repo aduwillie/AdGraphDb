@@ -50,6 +50,11 @@ The `DatabaseContext` trait exposes what queries need:
 pub trait DatabaseContext {
     fn get_node(&mut self, id: NodeId) -> Result<Option<Node>, GraphError>;
     fn get_all_nodes(&mut self) -> Result<Vec<Node>, GraphError>;
+
+    /// Fast-path: returns only nodes whose label matches, using the in-memory
+    /// LabelIndex (O(label_count)) instead of a full scan (O(N)).
+    fn get_nodes_by_label(&mut self, label: &str) -> Result<Vec<Node>, GraphError>;
+
     fn get_edge(&mut self, id: EdgeId) -> Result<Option<Edge>, GraphError>;
     fn get_all_edges(&mut self) -> Result<Vec<Edge>, GraphError>;
     fn node_count(&self) -> usize;
@@ -327,6 +332,14 @@ impl NodeFilter {
 }
 ```
 
-This is a **linear scan** of all nodes — O(N) for N nodes in the graph.
-For production-scale use, property indexes are needed.
+**When a label filter is present** the executor calls `ctx.get_nodes_by_label(label)`
+which performs an O(1) lookup in the in-memory `LabelIndex`, returning only
+the candidate set for that label.  Property conditions are then evaluated
+against that smaller set — O(label_count × conditions) instead of O(N).
+
+**When no label filter is present** a full scan is still used: `ctx.get_all_nodes()`
+loads every node and applies all conditions — O(N).
+
+For range queries on property values (e.g. `population > 1_000_000`) a
+BTree-based property index would reduce cost to O(log N + results).
 See [10_scale_and_production.md](10_scale_and_production.md).

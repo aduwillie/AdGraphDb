@@ -78,18 +78,29 @@ This is the "table scan" of graph databases.  It is how you turn an open
 question ("which nodes are cities?") into a concrete set of node IDs that you
 can then use as starting points for traversal.
 
-**What happens internally:**
+**What happens internally — with label filter (fast path):**
 ```
-executor::execute(MatchNodes(filter), ctx)
-  ctx.get_all_nodes()          ← load every node (cache → storage)
-  for each node:
-    filter.matches(node)       ← check label and property conditions
+executor::execute(MatchNodes(filter { label: Some("City"), ... }), ctx)
+  ctx.get_nodes_by_label("City")   ← O(1) LabelIndex lookup → [N0, N1, N3]
+  for each candidate (N0, N1, N3 only):
+    filter.matches(node)           ← check remaining property conditions
   return matched nodes
 ```
 
-The cost is **O(N)** where N is the total number of nodes.  Every node is
-examined, even those that don't match.  This is acceptable for small graphs;
-for large graphs you need indexes (see Part 6).
+**What happens internally — without label filter (full scan):**
+```
+executor::execute(MatchNodes(filter { label: None, ... }), ctx)
+  ctx.get_all_nodes()              ← load every node: O(N)
+  for each node:
+    filter.matches(node)           ← check all conditions
+  return matched nodes
+```
+
+The cost is **O(label_count)** when a label filter is present (using the
+in-memory `LabelIndex`), or **O(N)** when no label filter is given.
+Property-only filters still require a full scan — a BTree property index
+would reduce that to O(log N + results).  See Part 6 and
+[10_scale_and_production.md](10_scale_and_production.md).
 
 ### Mode B: Direct anchor (you know the ID)
 
@@ -633,8 +644,13 @@ O(log N)  →  btree.get("London")  →  { N0 }
 ```
 
 Instead of O(N), these are O(1) and O(log N) respectively.
-AdGraphDb does not include indexes yet — see [10_scale_and_production.md](10_scale_and_production.md)
-for how to add them.
+
+**The label index is now implemented** in `src/adapters/index/label_index.rs`.
+`MATCH NODE WHERE label = "City"` uses it automatically — the executor calls
+`ctx.get_nodes_by_label("City")` which does a single HashMap lookup.
+
+A BTree property index (for range queries like `population > 1_000_000`) is
+the next step — see [10_scale_and_production.md](10_scale_and_production.md).
 
 ---
 
@@ -785,23 +801,25 @@ GET EDGE E3                          O(1) cache / O(WAL) miss
 
 Use when you know the ID.  Fastest possible query.
 
-### "Find all things of a type" (label scan)
+### "Find all things of a type" (label lookup — now O(1))
 
 ```
-MATCH NODE WHERE label = "City"      O(N) — scans all nodes
-MATCH EDGE WHERE label = "RAIL"      O(E) — scans all edges
+MATCH NODE WHERE label = "City"      O(label_count) — LabelIndex HashMap lookup ✓
+MATCH EDGE WHERE label = "RAIL"      O(E) — edge label index not yet implemented
 ```
 
-Use when you need a set of candidates.  Expensive without an index.
+Node label queries use the in-memory `LabelIndex` automatically.
+Only nodes with that label are loaded; all others are skipped entirely.
 
-### "Find things with a property value" (property filter)
+### "Find things with a property value" (property filter — still O(N))
 
 ```
-MATCH NODE WHERE props.name = "London"      O(N) — scans all nodes
-MATCH EDGE WHERE weight < 500               O(E) — scans all edges
+MATCH NODE WHERE props.name = "London"      O(N) — full scan; no property index yet
+MATCH EDGE WHERE weight < 500               O(E) — full scan
 ```
 
-Same cost as label scan.  With a property index: O(log N).
+Property filters still require a full scan.  A BTree property index would
+reduce this to O(log N + results).  See [10_scale_and_production.md](10_scale_and_production.md).
 
 ### "Explore from a starting node" (traversal)
 
@@ -861,7 +879,8 @@ eliminate the repeated index lookups that SQL needs at each hop.
 
 | Concept | What it means |
 |---------|--------------|
-| Global scan | Load all nodes/edges, filter in memory — O(N) |
+| Label lookup | O(1) LabelIndex lookup when label filter present — O(label_count) |
+| Global scan | Load all nodes/edges, filter in memory — O(N); used when no label filter |
 | Point lookup | Load one node by ID — O(1) with cache |
 | Anchor node | The starting node for a traversal |
 | Traversal | Follow edges from an anchor — O(V+E) in RAM |

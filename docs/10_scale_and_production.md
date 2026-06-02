@@ -15,10 +15,10 @@ concrete techniques used by production graph databases to address them.
 | Limitation | Impact | Solution |
 |-----------|--------|---------|
 | WAL replay on every scan | O(N) reads for `load_all_nodes` | B-tree / LSM storage |
-| No property indexes | O(N) query filter evaluation | Secondary indexes |
+| Label index only — no property indexes | Label queries O(1) ✓; property range queries still O(N) | BTree property index |
 | Single-threaded | Only one reader or writer at a time | MVCC / read-write locks |
 | All structure in RAM | Graph must fit in adjacency list memory | Disk-resident graph |
-| No transactions | No atomic multi-operation changes | MVCC or 2PL |
+| Transactions (client-side buffer, not crash-safe mid-commit) | All-or-nothing staging ✓; power-loss mid-commit leaves partial data | WAL transaction markers |
 | No query planning | No cost-based optimisation | Query planner |
 | WAL grows unbounded | Must call compact() manually | Auto-compaction |
 
@@ -78,30 +78,27 @@ the full LSM adds the sorted-file layer and automatic background compaction.
 
 ## 2. Indexing
 
-### Current: full scan
+### Label index — implemented ✓
 
-Queries like `MATCH NODE WHERE label = "City"` scan all nodes.
-For 1 million nodes with 1000 cities, this reads 999 000 irrelevant nodes.
+`src/adapters/index/label_index.rs` — a `HashMap<String, Vec<NodeId>>` kept
+in sync with the engine on every insert and delete.
 
-### Solution: label index
+`LayeredGraphDatabase` holds a `LabelIndex` field.  On startup it is rebuilt
+from the nodes returned by `storage.load_all_nodes()` (no extra I/O).
+
+The query executor checks the label index automatically:
 
 ```rust
-// A HashMap from label → set of NodeIds
-pub struct LabelIndex {
-    index: HashMap<String, HashSet<NodeId>>,
-}
-
-impl LabelIndex {
-    fn add(&mut self, id: NodeId, label: &str) {
-        self.index.entry(label.to_string()).or_default().insert(id);
-    }
-    fn lookup(&self, label: &str) -> impl Iterator<Item = &NodeId> {
-        self.index.get(label).into_iter().flatten()
-    }
-}
+// query/executor.rs
+let candidates = match &filter.label {
+    Some(label) => ctx.get_nodes_by_label(label)?,  // O(1) index lookup
+    None        => ctx.get_all_nodes()?,             // O(N) full scan
+};
 ```
 
-With a label index, `MATCH (n:City)` becomes O(city_count) instead of O(N).
+`MATCH NODE WHERE label = "City"` is now O(city_count) instead of O(N).
+For 1 million nodes with 1 000 cities, this is a **1 000× speedup** — only
+1 000 nodes are loaded, not 1 000 000.
 
 ### Solution: property index (BTree-based range index)
 
@@ -182,26 +179,27 @@ Implementation complexity is significant but the pattern is well-understood.
 
 ## 4. Transactions
 
-### Current: no transaction support
+### Implemented: client-side write buffer ✓
 
-Each operation (insert_node, delete_edge, etc.) is independent.
-If two operations must be atomic — either both happen or neither — there is
-no mechanism to guarantee this.
-
-### Solution: Begin/Commit/Rollback
+`src/transaction/mod.rs` — `Transaction` is a staged write buffer.
+See [14_transactions.md](14_transactions.md) for the full reference.
 
 ```rust
-pub trait TransactionalDatabase {
-    fn begin(&mut self) -> TransactionId;
-    fn commit(&mut self, txn: TransactionId) -> Result<(), GraphError>;
-    fn rollback(&mut self, txn: TransactionId);
-}
+let mut txn = db.begin_transaction();
+let london = txn.stage_insert_node("City", props([("name", "London")]));
+let paris  = txn.stage_insert_node("City", props([("name", "Paris")]));
+txn.stage_insert_edge(london, paris, "RAIL", 457.0, HashMap::new());
+let result = db.commit_transaction(txn)?;   // all-or-nothing write
+// OR: db.rollback_transaction(txn);        // discard everything
 ```
 
-A WAL-based implementation:
-1. `begin` → start buffering operations in a local transaction log
-2. On `commit` → write all buffered records to the WAL atomically
-3. On `rollback` → discard the buffer (write nothing)
+**What it guarantees:** all staged operations are applied in order, or none
+if `rollback_transaction` is called.
+
+**Current limitation:** not crash-safe mid-commit.  If the process dies
+while `commit_transaction` is writing to the WAL, partial records may be
+left.  To fix this, add `BEGIN_TXN` / `COMMIT_TXN` WAL markers and discard
+incomplete transactions on replay — see Part 6 of [14_transactions.md](14_transactions.md).
 
 ---
 
@@ -306,12 +304,12 @@ let node_id = u64::from_le_bytes(mmap[offset..offset+8].try_into().unwrap());
 Listed in order of educational value and impact:
 
 1. **Auto-compaction** — compact when WAL exceeds a size threshold
-2. **Label index** — simple HashMap, dramatic query speedup
+2. ~~**Label index**~~ — **done** ✓ `src/adapters/index/label_index.rs`
 3. **Property index** — BTreeMap for range queries
 4. **Read-write lock** — enables concurrent reads
 5. **Checksums** — CRC32 per WAL record, detect corruption
 6. **B-tree storage** — replace WAL replay with O(log N) lookups
-7. **Transactions** — begin/commit/rollback semantics
+7. ~~**Transactions**~~ — **done** ✓ `src/transaction/mod.rs` (client-side buffer; WAL markers still TODO)
 8. **MVCC** — full reader-writer concurrency
 9. **Query planner** — cost-based index selection
 10. **Distributed** — partition and replicate across machines

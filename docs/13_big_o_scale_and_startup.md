@@ -175,36 +175,42 @@ Amazon Neptune, and TigerGraph.
 
 ## Part 3 — Do you have to scan every node for filter queries?
 
-### In the current implementation: yes
+### For label filters: no — the LabelIndex is used ✓
+
+The executor has a fast path when a label filter is present:
 
 ```rust
-// query/executor.rs
+// query/executor.rs  (actual current code)
 QueryCommand::MatchNodes(filter) => {
-    let all = ctx.get_all_nodes()?;                        // ← ALL nodes loaded
-    let matched = all.into_iter()
-        .filter(|n| filter.matches(n))                     // ← every node checked
+    let candidates = match &filter.label {
+        Some(label) => ctx.get_nodes_by_label(label)?,  // ← O(1) index lookup
+        None        => ctx.get_all_nodes()?,             // ← O(N) full scan
+    };
+    let matched: Vec<_> = candidates
+        .into_iter()
+        .filter(|n| filter.matches(n))                   // ← property conditions only
         .collect();
     Ok(QueryResult::Nodes(matched))
 }
 ```
 
-`ctx.get_all_nodes()` calls `engine.all_node_ids()` which returns every
-node ID, then loads each node's properties from the cache or storage.
-Every node is examined, even those that obviously don't match.
+`ctx.get_nodes_by_label("City")` calls into `LayeredGraphDatabase`, which
+consults the in-memory `LabelIndex` (`HashMap<String, Vec<NodeId>>`), gets
+back only the node IDs with that label, and loads only those nodes from
+cache or storage.
 
-This is the "full table scan" equivalent in a graph database.
+For 1 million nodes where 1 000 are cities:
+- Without label index: 1 000 000 nodes loaded and checked
+- With label index: 1 000 nodes loaded and checked — **1 000× faster**
 
-### Why this design was chosen for education
+### For property-only filters: yes — still a full scan
 
-The current design is deliberately simple.  The filter sits inside the
-executor, after retrieval.  This makes the code easy to follow:
+`MATCH NODE WHERE props.population > 1_000_000` (no label filter) still calls
+`ctx.get_all_nodes()` and scans every node.  This is the remaining O(N) case.
 
-```
-retrieve all → filter all → return matched
-```
-
-A production database inverts this: **filter during retrieval** using
-secondary indexes, so non-matching nodes are never loaded at all.
+A **property index** (BTree mapping `Value → Vec<NodeId>` per field) would
+make range queries O(log N + results).  It is not yet implemented — see
+[10_scale_and_production.md](10_scale_and_production.md) section 2 for the design.
 
 ### The solution: secondary indexes
 
@@ -260,45 +266,43 @@ With property index:
 With a label index, finding all cities in a graph with 1 billion nodes
 costs **exactly 1 operation** regardless of graph size.
 
-### How to add indexes to AdGraphDb
+### The label index — now implemented ✓
 
-The indexes sit alongside the engine.  They are updated on every
-`insert_node`, `delete_node`:
+`src/adapters/index/label_index.rs` contains the actual implementation:
 
 ```rust
-// Sketch: src/adapters/index/label_index.rs
 pub struct LabelIndex {
-    index: HashMap<String, HashSet<NodeId>>,
+    index: HashMap<String, Vec<NodeId>>,  // "City" → [N0, N1, N7, ...]
 }
 
 impl LabelIndex {
-    pub fn add(&mut self, id: NodeId, label: &str) {
-        self.index.entry(label.into()).or_default().insert(id);
-    }
-    pub fn remove(&mut self, id: NodeId, label: &str) {
-        if let Some(set) = self.index.get_mut(label) {
-            set.remove(&id);
-        }
-    }
-    pub fn lookup(&self, label: &str) -> impl Iterator<Item = &NodeId> {
-        self.index.get(label).into_iter().flatten()
-    }
+    pub fn insert(&mut self, id: NodeId, label: &str) { ... }   // called on insert_node
+    pub fn remove(&mut self, id: NodeId, label: &str) { ... }   // called on delete_node
+    pub fn get(&self, label: &str) -> &[NodeId] { ... }         // called by executor
 }
 ```
 
-The executor would check the index first:
+`LayeredGraphDatabase` holds a `LabelIndex` field and keeps it in sync.
+The executor calls `ctx.get_nodes_by_label(label)` which hits the index.
+This is active — no configuration required.
+
+### The next step: property index (not yet implemented)
+
+A BTree property index for range queries would look like:
+
 ```rust
-QueryCommand::MatchNodes(filter) => {
-    let candidate_ids = if let Some(label) = &filter.label {
-        // Use index: O(1) to find label set
-        label_index.lookup(label).copied().collect()
-    } else {
-        // No label filter: fall back to full scan
-        engine.all_node_ids()
-    };
-    // Load only candidate nodes (much smaller set)
-    // Then apply remaining property conditions
+// Future: src/adapters/index/property_index.rs
+pub struct PropertyIndex {
+    // field_name → sorted map of value → node IDs
+    index: HashMap<String, BTreeMap<Value, Vec<NodeId>>>,
 }
+```
+
+`MATCH NODE WHERE props.population > 1_000_000` would become:
+```
+btree.range(Integer(1_000_000)..)   O(log N) seek
+→ iterate forward until no match    O(results)
+Total: O(log N + results)
 ```
 
 ---
@@ -566,18 +570,18 @@ O(degree) means cost depends only on one node's connections, not the total graph
 | `GET NODE Nx` | ✓ Yes | O(1) cache lookup |
 | `TRAVERSE BFS FROM Nx` | ✓ Partial | O(reachable) — only visits nodes reachable from start |
 | `PATH FROM Nx TO Ny` | ✓ Partial | Same — bounded by reachable subgraph |
-| `MATCH NODE WHERE label = "City"` | ✗ No | Full scan — O(1 billion) |
+| `MATCH NODE WHERE label = "City"` | ✓ Yes (with label index) | O(city_count) — LabelIndex HashMap lookup |
 | Startup WAL replay | ✗ No | Reads terabytes, builds 700 GB engine |
 
 ### 3. Do you have to scan every node for filter queries?
 
-**In AdGraphDb today: yes.**
-The executor calls `ctx.get_all_nodes()` then filters in memory.
+**For label filters: no — the LabelIndex is implemented.**
+`MATCH NODE WHERE label = "City"` calls `ctx.get_nodes_by_label("City")`,
+which is a single HashMap lookup returning only city node IDs — O(1).
 
-**In a production graph database: no.**
-Secondary indexes (label index, property indexes) let the query planner
-jump directly to matching nodes — O(1) for label, O(log N) for properties.
-Adding these to AdGraphDb is the most impactful single improvement.
+**For property-only filters: yes — still O(N).**
+`MATCH NODE WHERE props.population > 1_000_000` still scans all nodes.
+A BTree property index would fix this; it is the next planned improvement.
 
 ### 4. How does graph structure persist and load?
 

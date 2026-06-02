@@ -23,6 +23,7 @@ pub mod core;
 pub mod database;
 pub mod ports;
 pub mod query;
+pub mod server;
 pub mod transaction;
 
 #[cfg(test)]

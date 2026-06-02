@@ -199,6 +199,106 @@ cargo test -- --test-threads=1
 
 ---
 
+## Server and CLI
+
+AdGraphDb ships two additional binaries beyond the demo.
+
+### Start the server
+
+```bash
+# Start with defaults: graph.json, port 7474
+cargo run --bin server
+
+# Custom database file, binary format, custom port
+cargo run --bin server -- --db cities.bin --format bin --port 9000
+
+# Disable cache (useful for testing storage correctness)
+cargo run --bin server -- --cache 0
+```
+
+The server accepts one TCP connection at a time (single-threaded, educational
+design — see `src/server/mod.rs` for the concurrency upgrade path).
+
+#### Server protocol (line-based text over TCP)
+
+```
+Client sends:   [lang:]<query>\n
+Server replies: OK\n<result>\n---END---\n
+              OR ERR\n<message>\n---END---\n
+```
+
+`lang` prefix is optional — `simple` (default) or `cypher`.
+
+```bash
+# Test with netcat / telnet
+echo "MATCH NODE WHERE label = \"City\"" | nc localhost 7474
+echo "cypher:MATCH (n:City) RETURN n"    | nc localhost 7474
+```
+
+### Interactive CLI
+
+```bash
+# Connect to a running server (default: localhost:7474)
+cargo run --bin cli
+
+# Connect to a custom server address
+cargo run --bin cli -- --server localhost:9000
+
+# Embedded mode — open a database file directly (no server needed)
+cargo run --bin cli -- --db graph.json
+cargo run --bin cli -- --db cities.bin --format bin
+```
+
+#### REPL session example
+
+```
+AdGraphDb CLI  (embedded mode)
+  File : graph.json  (format: json)
+  Graph: 5 node(s), 6 edge(s)
+  Type :help for commands, :quit to exit
+
+db(simple)> MATCH NODE WHERE label = "City"
+Nodes (5):
+  (N0 :City) {name: "London", population: 9000000}
+  (N1 :City) {name: "Paris", population: 2100000}
+  ...
+
+db(simple)> :use cypher
+Language: CypherLite
+
+db(cypher)> MATCH (n:City) WHERE n.population > 2000000 RETURN n
+Nodes (3):
+  (N0 :City) {name: "London", ...}
+  ...
+
+db(cypher)> TRAVERSE BFS FROM N0
+Traversal [5]: N0 → N1 → N2 → N3 → N4
+
+db(cypher)> PATH FROM N0 TO N4
+Path (912.00): N0 → N2 → N4
+
+db(cypher)> COUNT NODES
+Count: 5
+
+db(cypher)> :quit
+Goodbye!
+```
+
+#### REPL commands
+
+| Command | Effect |
+|---------|--------|
+| `<query>` | Run with current language |
+| `simple: <query>` | One-off SimpleQuery run |
+| `cypher: <query>` | One-off CypherLite run |
+| `:use simple` | Switch default to SimpleQuery |
+| `:use cypher` | Switch default to CypherLite |
+| `:lang` | Show current language |
+| `:help` | Print full help |
+| `:quit` / `:exit` | Exit |
+
+---
+
 ## Project structure
 
 ```
@@ -218,10 +318,19 @@ AdGraphDb/
 │   ├── 10_scale_and_production.md ← what it would take to scale
 │   ├── 11_adding_adapters.md    ← code templates for extension points
 │   ├── 12_query_execution_deep_dive.md ← how queries work end-to-end
-│   └── 13_big_o_scale_and_startup.md  ← V/E/degree, billion nodes, structure persistence
+│   ├── 13_big_o_scale_and_startup.md  ← V/E/degree; billion-node impact; startup
+│   ├── 14_transactions.md             ← ACID, transaction buffer, crash-safety
+│   └── 15_rust_concepts.md            ← every Rust concept used, with examples
 ├── src/
 │   ├── lib.rs
-│   ├── main.rs                  ← demo entry point
+│   ├── main.rs                  ← demo entry point (cargo run)
+│   ├── bin/
+│   │   ├── server.rs            ← TCP server binary  (cargo run --bin server)
+│   │   └── cli.rs               ← interactive REPL   (cargo run --bin cli)
+│   ├── server/
+│   │   └── mod.rs               ← GraphServer, protocol, connection handler
+│   ├── transaction/
+│   │   └── mod.rs               ← Transaction, CommitResult, StagedOp
 │   ├── core/                    ← pure domain types (no I/O)
 │   │   ├── value.rs
 │   │   ├── node.rs
