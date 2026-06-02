@@ -15,7 +15,7 @@ use crate::core::{
     node::{Node, NodeId},
 };
 
-pub trait CachePort {
+pub trait CachePort: Send {
     /// Look up a node. Updates recency if the implementation tracks it (LRU).
     /// Returns a clone so callers own the value and the cache can be mutated
     /// independently.

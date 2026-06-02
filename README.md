@@ -320,7 +320,9 @@ AdGraphDb/
 │   ├── 12_query_execution_deep_dive.md ← how queries work end-to-end
 │   ├── 13_big_o_scale_and_startup.md  ← V/E/degree; billion-node impact; startup
 │   ├── 14_transactions.md             ← ACID, transaction buffer, crash-safety
-│   └── 15_rust_concepts.md            ← every Rust concept used, with examples
+│   ├── 15_rust_concepts.md            ← every Rust concept used, with examples
+│   ├── 16_query_planner.md            ← cost model, EXPLAIN, extending the planner
+│   └── 17_concurrency_and_safety.md   ← Mutex model, checksums, WAL markers, MVCC roadmap
 ├── src/
 │   ├── lib.rs
 │   ├── main.rs                  ← demo entry point (cargo run)
@@ -328,7 +330,9 @@ AdGraphDb/
 │   │   ├── server.rs            ← TCP server binary  (cargo run --bin server)
 │   │   └── cli.rs               ← interactive REPL   (cargo run --bin cli)
 │   ├── server/
-│   │   └── mod.rs               ← GraphServer, protocol, connection handler
+│   │   └── mod.rs               ← multi-threaded GraphServer, line protocol
+│   ├── concurrent/
+│   │   └── mod.rs               ← SharedDatabase (Arc<Mutex<>> for threads)
 │   ├── transaction/
 │   │   └── mod.rs               ← Transaction, CommitResult, StagedOp
 │   ├── core/                    ← pure domain types (no I/O)
@@ -345,26 +349,32 @@ AdGraphDb/
 │   │   └── query_context.rs
 │   ├── adapters/                ← concrete implementations
 │   │   ├── storage/
-│   │   │   ├── json_file.rs     ← NDJSON WAL
-│   │   │   └── binary_file.rs   ← hand-written binary WAL
+│   │   │   ├── json_file.rs     ← NDJSON WAL + txn markers
+│   │   │   └── binary_file.rs   ← binary WAL + Adler-32 + txn markers
 │   │   ├── cache/
 │   │   │   ├── lru.rs           ← generation-counter LRU
 │   │   │   └── no_cache.rs      ← pass-through
-│   │   └── engine/
-│   │       └── adjacency_list.rs← HashMap-based adjacency index
+│   │   ├── engine/
+│   │   │   └── adjacency_list.rs← HashMap-based adjacency index
+│   │   └── index/
+│   │       ├── label_index.rs   ← HashMap<label, Vec<NodeId>> O(1) lookup
+│   │       └── property_index.rs← BTreeMap per field, O(log N) range queries
 │   ├── algorithms/
 │   │   ├── bfs.rs
 │   │   ├── dfs.rs
 │   │   └── dijkstra.rs
 │   ├── query/
-│   │   ├── ast.rs               ← QueryCommand IR
-│   │   ├── executor.rs          ← shared execution engine
+│   │   ├── ast.rs               ← QueryCommand IR + filters
+│   │   ├── executor.rs          ← execute_plan, execute_with_explain
+│   │   ├── planner.rs           ← QueryPlanner, ExecutionPlan, DatabaseStats
 │   │   ├── port.rs              ← QueryLanguagePort trait
 │   │   ├── result.rs            ← QueryResult type
 │   │   └── languages/
-│   │       ├── simple.rs        ← SimpleQuery DSL
-│   │       └── cypher_lite.rs   ← CypherLite DSL
+│   │       ├── simple.rs        ← SimpleQuery DSL parser
+│   │       └── cypher_lite.rs   ← CypherLite DSL parser
 │   └── database/
+│       ├── config.rs            ← DatabaseConfig (auto-compact, indexes, etc.)
+│       ├── metrics.rs           ← DatabaseMetrics (cache/index/query stats)
 │       └── layered.rs           ← LayeredGraphDatabase
 └── tests/
     └── integration_test.rs      ← full-stack tests
@@ -389,8 +399,10 @@ Read the docs in order for the best learning experience:
 11. **[11_adding_adapters.md](docs/11_adding_adapters.md)** — Code templates for new adapters.
 12. **[12_query_execution_deep_dive.md](docs/12_query_execution_deep_dive.md)** — How queries execute end-to-end with traced examples.
 13. **[13_big_o_scale_and_startup.md](docs/13_big_o_scale_and_startup.md)** — V/E/degree defined; billion-node impact; structure persistence.
-14. **[14_transactions.md](docs/14_transactions.md)** — ACID properties, how the transaction buffer works, WAL markers for crash-safety, isolation strategies.
+14. **[14_transactions.md](docs/14_transactions.md)** — ACID properties, transaction buffer, WAL markers, crash-safety.
 15. **[15_rust_concepts.md](docs/15_rust_concepts.md)** — Every Rust concept used in this repo, with code examples and rationale.
+16. **[16_query_planner.md](docs/16_query_planner.md)** — Cost model, EXPLAIN, property index design, configuration.
+17. **[17_concurrency_and_safety.md](docs/17_concurrency_and_safety.md)** — Mutex model, checksums, WAL transaction markers, MVCC roadmap.
 
 ---
 

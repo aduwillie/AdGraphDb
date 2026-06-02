@@ -15,10 +15,10 @@ concrete techniques used by production graph databases to address them.
 | Limitation | Impact | Solution |
 |-----------|--------|---------|
 | WAL replay on every scan | O(N) reads for `load_all_nodes` | B-tree / LSM storage |
-| Label index only — no property indexes | Label queries O(1) ✓; property range queries still O(N) | BTree property index |
-| Single-threaded | Only one reader or writer at a time | MVCC / read-write locks |
-| All structure in RAM | Graph must fit in adjacency list memory | Disk-resident graph |
-| Transactions (client-side buffer, not crash-safe mid-commit) | All-or-nothing staging ✓; power-loss mid-commit leaves partial data | WAL transaction markers |
+| Label index ✓ + Property index ✓ | Label O(1) ✓; property range O(log N) ✓; no edge property index yet | Edge property index |
+| Concurrent reads blocked by &mut cache | Mutex serialises all queries ✓ correct; only one runs at a time | Interior-mutability cache + RwLock |
+| All structure in RAM | Graph must fit in adjacency list memory | Disk-resident graph / lazy loading |
+| Transactions ✓ crash-safe (binary WAL) | BEGIN/COMMIT markers on binary WAL ✓; JSON WAL still unsafe | WAL markers on JSON adapter |
 | No query planning | No cost-based optimisation | Query planner |
 | WAL grows unbounded | Must call compact() manually | Auto-compaction |
 
@@ -78,7 +78,7 @@ the full LSM adds the sorted-file layer and automatic background compaction.
 
 ## 2. Indexing
 
-### Label index — implemented ✓
+### Label index — implemented ✓ · Property index — implemented ✓ · Query planner — implemented ✓
 
 `src/adapters/index/label_index.rs` — a `HashMap<String, Vec<NodeId>>` kept
 in sync with the engine on every insert and delete.
@@ -303,15 +303,15 @@ let node_id = u64::from_le_bytes(mmap[offset..offset+8].try_into().unwrap());
 
 Listed in order of educational value and impact:
 
-1. **Auto-compaction** — compact when WAL exceeds a size threshold
+1. ~~**Auto-compaction**~~ — **done** ✓ `DatabaseConfig::auto_compact_after_writes`
 2. ~~**Label index**~~ — **done** ✓ `src/adapters/index/label_index.rs`
-3. **Property index** — BTreeMap for range queries
-4. **Read-write lock** — enables concurrent reads
-5. **Checksums** — CRC32 per WAL record, detect corruption
+3. ~~**Property index**~~ — **done** ✓ `src/adapters/index/property_index.rs` (BTreeMap per field)
+4. **Read-write lock** — concurrent reads (blocked by `&mut` cache; needs interior mutability)
+5. ~~**Checksums**~~ — **done** ✓ Adler-32 on every binary WAL record
 6. **B-tree storage** — replace WAL replay with O(log N) lookups
-7. ~~**Transactions**~~ — **done** ✓ `src/transaction/mod.rs` (client-side buffer; WAL markers still TODO)
+7. ~~**Transactions**~~ — **done** ✓ crash-safe with BEGIN/COMMIT_TXN markers on binary WAL
 8. **MVCC** — full reader-writer concurrency
-9. **Query planner** — cost-based index selection
+9. ~~**Query planner**~~ — **done** ✓ `src/query/planner.rs` cost-based index selection
 10. **Distributed** — partition and replicate across machines
 
 Each step is independent and can be implemented as a new adapter,

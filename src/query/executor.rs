@@ -1,46 +1,79 @@
-// Executor — runs a QueryCommand against a DatabaseContext.
+// Executor — runs an ExecutionPlan (produced by QueryPlanner) against a
+// DatabaseContext.
 //
-// This is the single place where the IR (QueryCommand) is interpreted.
-// Every query language parser produces a QueryCommand; this function
-// executes it.  No parser imports this directly — they call it via
-// the shared helper in their QueryLanguagePort implementation.
-//
-// Pattern: Command + Invoker
-//   QueryCommand  = Command (carries intent)
-//   execute()     = Invoker (dispatches to receiver)
-//   DatabaseContext = Receiver (performs the actual work)
+// Public entry points:
+//   execute()                — plan + execute in one call (normal path)
+//   execute_with_explain()   — plan + execute, returns plan too (EXPLAIN / logging)
+//   execute_plan()           — run a pre-computed plan
 
 use crate::core::error::GraphError;
 use crate::ports::query_context::DatabaseContext;
 use crate::query::{
     ast::{QueryCommand, TraversalKind},
+    planner::{ExecutionPlan, QueryPlanner},
     result::QueryResult,
 };
 
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Plan and execute a query in one step.
 pub fn execute(
     command: QueryCommand,
     ctx: &mut dyn DatabaseContext,
 ) -> Result<QueryResult, GraphError> {
-    match command {
-        // ── Structural matches ────────────────────────────────────────────────
+    let stats = ctx.stats();
+    let plan  = QueryPlanner::plan(command, &stats);
+    execute_plan(plan, ctx)
+}
 
-        QueryCommand::MatchNodes(filter) => {
-            // Fast path: if the filter names a label, use the label index
-            // to fetch only the matching candidate set — O(label_count).
-            // Slow path: no label specified → full scan — O(N).
-            let candidates = match &filter.label {
-                Some(label) => ctx.get_nodes_by_label(label)?,
-                None        => ctx.get_all_nodes()?,
-            };
-            // Apply any remaining property conditions across the candidate set.
+/// Plan and execute, returning the chosen plan alongside the result.
+/// Use this to log slow queries with their plan or to implement EXPLAIN.
+pub fn execute_with_explain(
+    command: QueryCommand,
+    ctx: &mut dyn DatabaseContext,
+) -> Result<(QueryResult, ExecutionPlan), GraphError> {
+    let stats = ctx.stats();
+    let plan  = QueryPlanner::plan(command, &stats);
+    let result = execute_plan(plan.clone(), ctx)?;
+    Ok((result, plan))
+}
+
+/// Run a pre-computed plan directly (skips the planner).
+pub fn execute_plan(
+    plan: ExecutionPlan,
+    ctx: &mut dyn DatabaseContext,
+) -> Result<QueryResult, GraphError> {
+    match plan {
+        // ── Node match strategies ─────────────────────────────────────────────
+
+        ExecutionPlan::PropertyIndexScan { field, op, value, remaining_filter } => {
+            let candidates = ctx.get_nodes_by_property(&field, &op, &value)?;
             let matched: Vec<_> = candidates
                 .into_iter()
-                .filter(|n| filter.matches(n))
+                .filter(|n| remaining_filter.matches(n))
                 .collect();
             Ok(QueryResult::Nodes(matched))
         }
 
-        QueryCommand::MatchEdges(filter) => {
+        ExecutionPlan::LabelIndexScan { label: _, remaining_filter } => {
+            let label = remaining_filter.label.as_deref().unwrap_or("");
+            let candidates = ctx.get_nodes_by_label(label)?;
+            let matched: Vec<_> = candidates
+                .into_iter()
+                .filter(|n| remaining_filter.matches(n))
+                .collect();
+            Ok(QueryResult::Nodes(matched))
+        }
+
+        ExecutionPlan::FullNodeScan { filter } => {
+            let all = ctx.get_all_nodes()?;
+            let matched: Vec<_> = all.into_iter().filter(|n| filter.matches(n)).collect();
+            Ok(QueryResult::Nodes(matched))
+        }
+
+        // ── Edge strategies ───────────────────────────────────────────────────
+
+        ExecutionPlan::FullEdgeScan { filter } => {
             let all = ctx.get_all_edges()?;
             let matched: Vec<_> = all.into_iter().filter(|e| filter.matches(e)).collect();
             Ok(QueryResult::Edges(matched))
@@ -48,17 +81,15 @@ pub fn execute(
 
         // ── Point lookups ─────────────────────────────────────────────────────
 
-        QueryCommand::GetNode(id) => {
-            Ok(QueryResult::SingleNode(ctx.get_node(id)?))
-        }
+        ExecutionPlan::NodeLookup { id } =>
+            Ok(QueryResult::SingleNode(ctx.get_node(id)?)),
 
-        QueryCommand::GetEdge(id) => {
-            Ok(QueryResult::SingleEdge(ctx.get_edge(id)?))
-        }
+        ExecutionPlan::EdgeLookup { id } =>
+            Ok(QueryResult::SingleEdge(ctx.get_edge(id)?)),
 
         // ── Traversals ────────────────────────────────────────────────────────
 
-        QueryCommand::Traverse { kind, start } => {
+        ExecutionPlan::Traverse { kind, start } => {
             let ids = match kind {
                 TraversalKind::Bfs => ctx.traverse_bfs(start),
                 TraversalKind::Dfs => ctx.traverse_dfs(start),
@@ -68,16 +99,15 @@ pub fn execute(
 
         // ── Shortest path ─────────────────────────────────────────────────────
 
-        QueryCommand::ShortestPath { start, goal } => {
+        ExecutionPlan::ShortestPath { start, goal } =>
             match ctx.shortest_path_dijkstra(start, goal) {
-                Some((nodes, total_weight)) => Ok(QueryResult::Path { nodes, total_weight }),
-                None => Ok(QueryResult::Empty),
-            }
-        }
+                Some((nodes, weight)) => Ok(QueryResult::Path { nodes, total_weight: weight }),
+                None                  => Ok(QueryResult::Empty),
+            },
 
         // ── Counts ────────────────────────────────────────────────────────────
 
-        QueryCommand::CountNodes => Ok(QueryResult::Count(ctx.node_count())),
-        QueryCommand::CountEdges => Ok(QueryResult::Count(ctx.edge_count())),
+        ExecutionPlan::CountNodes => Ok(QueryResult::Count(ctx.node_count())),
+        ExecutionPlan::CountEdges => Ok(QueryResult::Count(ctx.edge_count())),
     }
 }

@@ -248,10 +248,26 @@ fn parse_match(&mut self) -> Result<QueryCommand, GraphError> {
 Each method handles one grammar rule.  The parser is a cascade of small,
 readable functions — no regex, no parser combinator library.
 
-### Stage 3: Execute
+### Stage 3: Plan
 
-The executor (`query/executor.rs`) is a single `match` statement over
-`QueryCommand` variants.  It dispatches to `DatabaseContext` methods:
+`QueryPlanner::plan(command, &stats)` converts the `QueryCommand` into an
+`ExecutionPlan` — the cheapest available strategy given current indexes.
+This adds negligible overhead (microseconds) but can eliminate O(N) scans.
+
+```
+QueryCommand::MatchNodes(NodeFilter { label: Some("City"), population > 1M })
+    ↓ planner sees: population is in PropertyIndex, cost ≈ log(N) + N/10
+    ↓               label_count("City") = 500, cost = 500
+    ↓               full scan cost = N = 1_000_000
+    ↓ picks: PropertyIndexScan { field: "population", op: Gt, value: 1M, ... }
+```
+
+See [16_query_planner.md](16_query_planner.md) for the full cost model.
+
+### Stage 4: Execute
+
+The executor (`query/executor.rs`) dispatches on the `ExecutionPlan` variant
+rather than the `QueryCommand`.  Each variant has one code path:
 
 ```rust
 pub fn execute(command: QueryCommand, ctx: &mut dyn DatabaseContext)

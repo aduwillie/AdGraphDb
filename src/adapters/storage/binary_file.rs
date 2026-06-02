@@ -3,11 +3,11 @@
 // This adapter is intentionally verbose so every byte is visible and
 // understandable.  No external serialization library is used.
 //
-// ── File format ───────────────────────────────────────────────────────────────
+// ── File format v2 ───────────────────────────────────────────────────────────
 //
 //  Header (8 bytes):
 //    [0..4]  magic  = b"AGDB"
-//    [4..8]  version = 1u32 little-endian
+//    [4..8]  version = 2u32 little-endian
 //
 //  Records (variable length, appended one after another):
 //    [0]     record_type : u8
@@ -15,7 +15,19 @@
 //              0x02 = UpsertEdge
 //              0x03 = DeleteNode
 //              0x04 = DeleteEdge
-//    [1..]   payload (see encode_node / encode_edge)
+//              0x05 = BeginTxn    [u64: txn_id]
+//              0x06 = CommitTxn   [u64: txn_id]
+//              0x07 = RollbackTxn [u64: txn_id]
+//    [1..]   payload
+//    [-4..]  Adler-32 checksum of (record_type byte + payload), u32 LE
+//
+// Adler-32 is computed over every byte from record_type through end of payload.
+// On replay, a checksum mismatch causes the record to be skipped with a warning.
+//
+// WAL transaction semantics:
+//   Records between BeginTxn and CommitTxn are buffered during replay.
+//   If EOF is reached without a matching CommitTxn, the buffered records
+//   are discarded (rolled back).  This makes multi-op commits crash-safe.
 //
 // ── Node payload ──────────────────────────────────────────────────────────────
 //    [u64]   node_id
@@ -61,12 +73,31 @@ use crate::core::{
 use crate::ports::storage::StoragePort;
 
 const MAGIC: &[u8; 4] = b"AGDB";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
-const RECORD_UPSERT_NODE: u8 = 0x01;
-const RECORD_UPSERT_EDGE: u8 = 0x02;
-const RECORD_DELETE_NODE: u8 = 0x03;
-const RECORD_DELETE_EDGE: u8 = 0x04;
+const RECORD_UPSERT_NODE:  u8 = 0x01;
+const RECORD_UPSERT_EDGE:  u8 = 0x02;
+const RECORD_DELETE_NODE:  u8 = 0x03;
+const RECORD_DELETE_EDGE:  u8 = 0x04;
+const RECORD_BEGIN_TXN:    u8 = 0x05;
+const RECORD_COMMIT_TXN:   u8 = 0x06;
+const RECORD_ROLLBACK_TXN: u8 = 0x07;
+
+// ── Adler-32 checksum ─────────────────────────────────────────────────────────
+//
+// A simple and fast checksum algorithm (RFC 1950).
+// Detects single-bit errors and most burst errors.
+// Appended to every record as a 4-byte LE u32.
+
+fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a.wrapping_add(byte as u32)) % MOD;
+        b = (b.wrapping_add(a))           % MOD;
+    }
+    (b << 16) | a
+}
 
 const VALUE_NULL: u8 = 0x00;
 const VALUE_BOOLEAN: u8 = 0x01;
@@ -209,6 +240,16 @@ fn eof(what: &str) -> GraphError {
 }
 
 // ── Node / Edge codec ─────────────────────────────────────────────────────────
+//
+// Every record ends with a 4-byte Adler-32 checksum of all bytes in that
+// record (including the record_type byte).  The checksum is computed AFTER
+// the payload is assembled so it covers everything.
+
+fn with_checksum(mut buf: Vec<u8>) -> Vec<u8> {
+    let csum = adler32(&buf);
+    write_u32(&mut buf, csum);
+    buf
+}
 
 fn encode_node(node: &Node) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -216,7 +257,7 @@ fn encode_node(node: &Node) -> Vec<u8> {
     write_u64(&mut buf, node.id.0);
     write_str(&mut buf, &node.label);
     write_properties(&mut buf, &node.properties);
-    buf
+    with_checksum(buf)
 }
 
 fn encode_edge(edge: &Edge) -> Vec<u8> {
@@ -228,21 +269,28 @@ fn encode_edge(edge: &Edge) -> Vec<u8> {
     write_str(&mut buf, &edge.label);
     write_f64(&mut buf, edge.weight);
     write_properties(&mut buf, &edge.properties);
-    buf
+    with_checksum(buf)
 }
 
 fn encode_delete_node(id: NodeId) -> Vec<u8> {
     let mut buf = Vec::new();
     write_u8(&mut buf, RECORD_DELETE_NODE);
     write_u64(&mut buf, id.0);
-    buf
+    with_checksum(buf)
 }
 
 fn encode_delete_edge(id: EdgeId) -> Vec<u8> {
     let mut buf = Vec::new();
     write_u8(&mut buf, RECORD_DELETE_EDGE);
     write_u64(&mut buf, id.0);
-    buf
+    with_checksum(buf)
+}
+
+fn encode_txn_marker(record_type: u8, txn_id: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_u8(&mut buf, record_type);
+    write_u64(&mut buf, txn_id);
+    with_checksum(buf)
 }
 
 fn decode_node(data: &[u8], pos: &mut usize) -> Result<Node, GraphError> {
@@ -323,38 +371,146 @@ impl BinaryFileStorage {
             )));
         }
 
+        let use_checksums = file_version >= 2;
+
         let mut pos = 8; // Skip header.
         let mut nodes: HashMap<NodeId, Node> = HashMap::new();
         let mut edges: HashMap<EdgeId, Edge> = HashMap::new();
 
+        // In-flight transaction buffer: BeginTxn → CommitTxn bracket.
+        // If CommitTxn is never seen (crash), these are discarded on EOF.
+        let mut txn_buffer: Option<(u64, Vec<(NodeId, Node)>, Vec<(EdgeId, Edge)>,
+                                         Vec<NodeId>, Vec<EdgeId>)> = None;
+
         while pos < data.len() {
-            let record_type = read_u8(&data, &mut pos)?;
-            match record_type {
-                RECORD_UPSERT_NODE => {
-                    let node = decode_node(&data, &mut pos)?;
-                    nodes.insert(node.id, node);
+            let record_start = pos;
+            let record_type = match read_u8(&data, &mut pos) {
+                Ok(t) => t,
+                Err(_) => break, // Truncated file — stop gracefully
+            };
+
+            // ── Decode payload ────────────────────────────────────────────────
+            let decoded = decode_record(record_type, &data, &mut pos);
+
+            // ── Verify checksum if v2 ─────────────────────────────────────────
+            if use_checksums {
+                match read_u32(&data, &mut pos) {
+                    Ok(stored_csum) => {
+                        let payload_bytes = &data[record_start..pos - 4];
+                        let computed = adler32(payload_bytes);
+                        if computed != stored_csum {
+                            eprintln!(
+                                "[BinaryFileStorage] checksum mismatch at offset {record_start} \
+                                 (stored={stored_csum:#010x}, computed={computed:#010x}) — skipping record"
+                            );
+                            continue;
+                        }
+                    }
+                    Err(_) => break, // Truncated checksum — stop
                 }
-                RECORD_UPSERT_EDGE => {
-                    let edge = decode_edge(&data, &mut pos)?;
-                    edges.insert(edge.id, edge);
+            }
+
+            // ── Apply or buffer ────────────────────────────────────────────────
+            match decoded {
+                Ok(RecordData::BeginTxn(txn_id)) => {
+                    // Start buffering.
+                    txn_buffer = Some((txn_id, vec![], vec![], vec![], vec![]));
                 }
-                RECORD_DELETE_NODE => {
-                    let id = NodeId(read_u64(&data, &mut pos)?);
-                    nodes.remove(&id);
+                Ok(RecordData::CommitTxn(txn_id)) => {
+                    if let Some((bid, n_ins, e_ins, n_del, e_del)) = txn_buffer.take() {
+                        if bid == txn_id {
+                            // Apply buffered records.
+                            for (id, node) in n_ins { nodes.insert(id, node); }
+                            for (id, edge) in e_ins { edges.insert(id, edge); }
+                            for id in n_del { nodes.remove(&id); }
+                            for id in e_del { edges.remove(&id); }
+                        }
+                        // else: mismatched txn_id — discard
+                    }
                 }
-                RECORD_DELETE_EDGE => {
-                    let id = EdgeId(read_u64(&data, &mut pos)?);
-                    edges.remove(&id);
+                Ok(RecordData::RollbackTxn(_)) => {
+                    txn_buffer = None; // Discard buffered records
                 }
-                other => {
-                    return Err(GraphError::DeserializationError(format!(
-                        "unknown record type 0x{other:02x} at byte offset {pos}"
-                    )));
+                Ok(record) => {
+                    apply_or_buffer(record, &mut nodes, &mut edges, &mut txn_buffer);
+                }
+                Err(e) => {
+                    eprintln!("[BinaryFileStorage] decode error at offset {record_start}: {e} — stopping replay");
+                    break;
                 }
             }
         }
 
+        // If txn_buffer is still Some at EOF, the BeginTxn had no CommitTxn
+        // (process crashed mid-commit).  Discard the buffered records.
+        if txn_buffer.is_some() {
+            eprintln!("[BinaryFileStorage] incomplete transaction at EOF — rolled back");
+        }
+
         Ok((nodes, edges))
+    }
+
+    pub fn wal_file_size(&self) -> u64 {
+        self.path.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+// ── Decoded record variants ────────────────────────────────────────────────────
+
+enum RecordData {
+    UpsertNode(Node),
+    UpsertEdge(Edge),
+    DeleteNode(NodeId),
+    DeleteEdge(EdgeId),
+    BeginTxn(u64),
+    CommitTxn(u64),
+    RollbackTxn(u64),
+}
+
+fn decode_record(record_type: u8, data: &[u8], pos: &mut usize) -> Result<RecordData, GraphError> {
+    match record_type {
+        RECORD_UPSERT_NODE  => Ok(RecordData::UpsertNode(decode_node(data, pos)?)),
+        RECORD_UPSERT_EDGE  => Ok(RecordData::UpsertEdge(decode_edge(data, pos)?)),
+        RECORD_DELETE_NODE  => Ok(RecordData::DeleteNode(NodeId(read_u64(data, pos)?))),
+        RECORD_DELETE_EDGE  => Ok(RecordData::DeleteEdge(EdgeId(read_u64(data, pos)?))),
+        RECORD_BEGIN_TXN    => Ok(RecordData::BeginTxn(read_u64(data, pos)?)),
+        RECORD_COMMIT_TXN   => Ok(RecordData::CommitTxn(read_u64(data, pos)?)),
+        RECORD_ROLLBACK_TXN => Ok(RecordData::RollbackTxn(read_u64(data, pos)?)),
+        other => Err(GraphError::DeserializationError(format!(
+            "unknown record type 0x{other:02x}"
+        ))),
+    }
+}
+
+type TxnBuffer = Option<(u64, Vec<(NodeId, Node)>, Vec<(EdgeId, Edge)>, Vec<NodeId>, Vec<EdgeId>)>;
+
+fn apply_or_buffer(
+    record: RecordData,
+    nodes:  &mut HashMap<NodeId, Node>,
+    edges:  &mut HashMap<EdgeId, Edge>,
+    buf:    &mut TxnBuffer,
+) {
+    match buf {
+        None => {
+            // No active transaction — apply immediately.
+            match record {
+                RecordData::UpsertNode(n) => { nodes.insert(n.id, n); }
+                RecordData::UpsertEdge(e) => { edges.insert(e.id, e); }
+                RecordData::DeleteNode(id) => { nodes.remove(&id); }
+                RecordData::DeleteEdge(id) => { edges.remove(&id); }
+                _ => {}
+            }
+        }
+        Some((_, n_ins, e_ins, n_del, e_del)) => {
+            // Inside a transaction — buffer for later commit.
+            match record {
+                RecordData::UpsertNode(n) => n_ins.push((n.id, n)),
+                RecordData::UpsertEdge(e) => e_ins.push((e.id, e)),
+                RecordData::DeleteNode(id) => n_del.push(id),
+                RecordData::DeleteEdge(id) => e_del.push(id),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -432,6 +588,22 @@ impl StoragePort for BinaryFileStorage {
             .map_err(|e| GraphError::StorageIo(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn wal_size_bytes(&self) -> u64 {
+        self.wal_file_size()
+    }
+
+    fn begin_wal_transaction(&mut self, txn_id: u64) -> Result<(), GraphError> {
+        self.append_bytes(&encode_txn_marker(RECORD_BEGIN_TXN, txn_id))
+    }
+
+    fn commit_wal_transaction(&mut self, txn_id: u64) -> Result<(), GraphError> {
+        self.append_bytes(&encode_txn_marker(RECORD_COMMIT_TXN, txn_id))
+    }
+
+    fn rollback_wal_transaction(&mut self, txn_id: u64) -> Result<(), GraphError> {
+        self.append_bytes(&encode_txn_marker(RECORD_ROLLBACK_TXN, txn_id))
     }
 }
 

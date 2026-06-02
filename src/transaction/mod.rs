@@ -62,17 +62,28 @@ pub enum StagedOp {
 // ── Transaction ───────────────────────────────────────────────────────────────
 
 pub struct Transaction {
+    /// Unique ID for this transaction — used for WAL markers.
+    txn_id: u64,
     operations: Vec<StagedOp>,
     /// Snapshot of the database's ID generator at begin time.
     /// Advances as operations are staged.
     id_gen: IdGenerator,
 }
 
+static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Transaction {
     /// Called by LayeredGraphDatabase::begin_transaction — not public API.
     pub(crate) fn new(id_gen_snapshot: IdGenerator) -> Self {
-        Self { operations: Vec::new(), id_gen: id_gen_snapshot }
+        Self {
+            txn_id: TXN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            operations: Vec::new(),
+            id_gen: id_gen_snapshot,
+        }
     }
+
+    /// Unique identifier for this transaction (used in WAL markers).
+    pub fn id(&self) -> u64 { self.txn_id }
 
     // ── Staging ───────────────────────────────────────────────────────────────
 

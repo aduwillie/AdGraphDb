@@ -9,3 +9,4 @@
 //                converts O(N) label scans to O(1) lookups
 
 pub mod label_index;
+pub mod property_index;

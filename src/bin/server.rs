@@ -24,7 +24,8 @@ use ad_graph_db::{
         engine::adjacency_list::AdjacencyListEngine,
         storage::{binary_file::BinaryFileStorage, json_file::JsonFileStorage},
     },
-    database::layered::LayeredGraphDatabase,
+    concurrent::SharedDatabase,
+    database::{config::DatabaseConfig, layered::LayeredGraphDatabase},
     ports::{cache::CachePort, storage::StoragePort},
     server::GraphServer,
 };
@@ -89,7 +90,8 @@ fn main() {
         db.node_count(), db.edge_count());
 
     // ── Start server ──────────────────────────────────────────────────────────
-    let mut server = GraphServer::new(db, addr);
+    let shared = SharedDatabase::new(db);
+    let server = GraphServer::new(shared, addr);
 
     if let Err(e) = server.start() {
         eprintln!("Server error: {e}");

@@ -25,7 +25,7 @@ pub struct Neighbor {
     pub weight: f64,
 }
 
-pub trait GraphEnginePort {
+pub trait GraphEnginePort: Send {
     /// Register a node's existence in the structural index.
     fn insert_node(&mut self, id: NodeId);
 

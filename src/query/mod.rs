@@ -20,5 +20,6 @@
 pub mod ast;
 pub mod executor;
 pub mod languages;
+pub mod planner;
 pub mod port;
 pub mod result;

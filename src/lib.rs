@@ -19,6 +19,7 @@
 
 pub mod algorithms;
 pub mod adapters;
+pub mod concurrent;
 pub mod core;
 pub mod database;
 pub mod ports;
