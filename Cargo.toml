@@ -16,6 +16,10 @@ path = "src/bin/server.rs"
 name = "cli"
 path = "src/bin/cli.rs"
 
+[[bin]]
+name = "runbook"
+path = "src/bin/runbook.rs"
+
 [lib]
 name = "ad_graph_db"
 path = "src/lib.rs"

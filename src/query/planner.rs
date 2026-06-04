@@ -263,13 +263,6 @@ mod tests {
         s
     }
 
-    fn stats_with_property_index(field: &str, total: usize) -> DatabaseStats {
-        let mut s = DatabaseStats::empty();
-        s.node_count = total;
-        s.indexed_node_fields.insert(field.into());
-        s
-    }
-
     #[test]
     fn empty_filter_produces_full_scan() {
         let stats = DatabaseStats::empty();

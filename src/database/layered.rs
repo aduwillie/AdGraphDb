@@ -63,7 +63,6 @@ use crate::query::{
     planner::DatabaseStats,
     port::QueryLanguagePort,
     result::QueryResult,
-    executor::execute_with_explain,
 };
 use crate::transaction::{CommitResult, Transaction};
 
@@ -416,6 +415,28 @@ impl LayeredGraphDatabase {
     pub fn reset_metrics(&mut self) { self.metrics = DatabaseMetrics::new(); }
 
     pub fn config(&self) -> &DatabaseConfig { &self.config }
+
+    /// All distinct node labels and how many nodes carry each, sorted by count desc.
+    pub fn label_stats(&self) -> Vec<(String, usize)> {
+        let mut stats: Vec<(String, usize)> = self.label_index.all_labels()
+            .map(|l| (l.to_string(), self.label_index.label_count(l)))
+            .collect();
+        stats.sort_by(|a, b| b.1.cmp(&a.1));
+        stats
+    }
+
+    /// All property fields that have a secondary index.
+    pub fn indexed_fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = self.property_index
+            .indexed_fields()
+            .map(|s| s.to_string())
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    /// Approximate WAL size in bytes (storage-adapter-dependent; 0 if unknown).
+    pub fn wal_size_bytes(&self) -> u64 { self.storage.wal_size_bytes() }
 
     fn build_stats(&self) -> DatabaseStats {
         let mut label_counts = std::collections::HashMap::new();

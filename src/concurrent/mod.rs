@@ -33,13 +33,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::core::{
-    edge::EdgeId,
     error::GraphError,
     node::{Node, NodeId},
     value::Value,
 };
 use crate::database::{
-    config::DatabaseConfig,
     layered::LayeredGraphDatabase,
     metrics::DatabaseMetrics,
 };
@@ -63,7 +61,7 @@ impl SharedDatabase {
 
     /// Lock the database and return a guard.
     /// The guard releases the lock when dropped.
-    pub fn lock(&self) -> MutexGuard<LayeredGraphDatabase> {
+    pub fn lock(&self) -> MutexGuard<'_, LayeredGraphDatabase> {
         self.inner.lock().expect("database mutex poisoned")
     }
 

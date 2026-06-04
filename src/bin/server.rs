@@ -25,7 +25,7 @@ use ad_graph_db::{
         storage::{binary_file::BinaryFileStorage, json_file::JsonFileStorage},
     },
     concurrent::SharedDatabase,
-    database::{config::DatabaseConfig, layered::LayeredGraphDatabase},
+    database::layered::LayeredGraphDatabase,
     ports::{cache::CachePort, storage::StoragePort},
     server::GraphServer,
 };

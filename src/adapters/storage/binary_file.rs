@@ -464,7 +464,7 @@ enum RecordData {
     DeleteEdge(EdgeId),
     BeginTxn(u64),
     CommitTxn(u64),
-    RollbackTxn(u64),
+    RollbackTxn(#[allow(dead_code)] u64),
 }
 
 fn decode_record(record_type: u8, data: &[u8], pos: &mut usize) -> Result<RecordData, GraphError> {
